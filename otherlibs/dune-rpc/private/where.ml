@@ -58,6 +58,8 @@ let rpc_socket_relative_to_build_dir = ".rpc/dune"
 
 let _DUNE_RPC = "DUNE_RPC"
 
+let env_var = _DUNE_RPC
+
 let to_dbus : t -> Dbus_address.t = function
   | `Unix p -> { name = "unix"; args = [ ("path", p) ] }
   | `Ip (`Host host, `Port port) ->
@@ -80,6 +82,14 @@ let sexp : t Conv.value =
 let add_to_env t env =
   let value = to_string t in
   Env.add env ~var:_DUNE_RPC ~value
+
+let of_env env =
+  match Env.get env _DUNE_RPC with
+  | None -> Error `Missing
+  | Some s -> (
+    match of_string s with
+    | Error exn -> Error (`Exn exn)
+    | Ok s -> Ok s)
 
 module type S = sig
   type 'a fiber

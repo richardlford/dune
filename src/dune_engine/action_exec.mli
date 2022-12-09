@@ -26,15 +26,20 @@ module Exec_result : sig
   type t = { dynamic_deps_stages : (Dynamic_dep.Set.t * Dep.Facts.t) List.t }
 end
 
+type input =
+  { targets :
+      Targets.Validated.t option (* Some Jane Street actions use [None] *)
+  ; root : Path.t
+  ; context : Build_context.t option
+  ; env : Env.t
+  ; rule_loc : Loc.t
+  ; execution_parameters : Execution_parameters.t
+  ; action : Action.t
+  }
+
 (** [root] should be the root of the current build context, or the root of the
     sandbox if the action is sandboxed. *)
 val exec :
-     targets:Targets.Validated.t option (* Some Jane Street actions use [None] *)
-  -> root:Path.t
-  -> context:Build_context.t option
-  -> env:Env.t
-  -> rule_loc:Loc.t
+     input
   -> build_deps:(Dep.Set.t -> Dep.Fact.t Dep.Map.t Fiber.t)
-  -> execution_parameters:Execution_parameters.t
-  -> Action.t
   -> Exec_result.t Fiber.t

@@ -7,6 +7,7 @@ val create :
   -> registry:[ `Add | `Skip ]
   -> root:string
   -> Dune_stats.t option
+  -> Dune_engine.Action_runner.Rpc_server.t
   -> t
 
 val listening_address : t -> Dune_rpc.Where.t

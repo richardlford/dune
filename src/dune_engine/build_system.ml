@@ -467,8 +467,17 @@ end = struct
       with_locks locks ~f:(fun () ->
           let build_deps deps = Memo.run (build_deps deps) in
           let+ action_exec_result =
-            Action_exec.exec ~root ~context ~env ~targets:(Some targets)
-              ~rule_loc:loc ~build_deps ~execution_parameters action
+            let input =
+              { Action_exec.root
+              ; context
+              ; env
+              ; targets = Some targets
+              ; rule_loc = loc
+              ; execution_parameters
+              ; action
+              }
+            in
+            Action_exec.exec input ~build_deps
           in
           let produced_targets =
             match sandbox with
