@@ -17,3 +17,11 @@ val extend_build_path_prefix_map :
   -> [ `Existing_rules_have_precedence | `New_rules_have_precedence ]
   -> Build_path_prefix_map.map
   -> Env.t
+
+val map_for_context : Build_path_prefix_map.map String.Map.t ref
+
+val extend_build_map_for_context :
+     Env.t
+  -> [ `Existing_rules_have_precedence | `New_rules_have_precedence ]
+  -> string
+  -> Env.t

@@ -173,6 +173,37 @@ module Descr = struct
         ]
   end
 
+  module Package_desc = struct
+    type t =
+      { name : Package.Name.t (** name of the package *)
+        ; entries : Install.Entry.Sourced.t list
+      }  
+
+    let kind_to_dyn = function
+    | `Directory -> Dyn.string "directory"
+    | `File -> Dyn.string "file"
+
+    let entry_to_dyn (entrys: Install.Entry.Sourced.t) : Dyn.t =
+      let (ent: Path.Build.t Install.Entry.t) = entrys.entry in
+      let open Dyn in
+      record
+      [ ("src", Path.Build.to_dyn ent.src)
+        ; ("kind", kind_to_dyn ent.kind)
+        ; ("dst", Install.Dst.to_dyn ent.dst)
+        ; ("section", Section.to_dyn ent.section)
+      ]
+
+      let to_dyn
+      { name; entries }:
+      Dyn.t =
+      let open Dyn in
+      ignore entries;
+      record
+      [ ("name", Package.Name.to_dyn name)
+      ; ("entries", list entry_to_dyn entries)
+      ]
+  end
+
   (** Description of items: executables, or libraries *)
   module Item = struct
     type t =
@@ -180,6 +211,7 @@ module Descr = struct
       | Library of Lib.t
       | Root of Path.t
       | Build_context of Path.t
+      | Package of Package_desc.t
 
     let map_path t ~f =
       match t with
@@ -187,6 +219,7 @@ module Descr = struct
       | Library lib -> Library (Lib.map_path lib ~f)
       | Root r -> Root (f r)
       | Build_context c -> Build_context (f c)
+      | Package p -> Package p
 
     (** Conversion to the [Dyn.t] type *)
     let to_dyn options : t -> Dyn.t = function
@@ -198,6 +231,8 @@ module Descr = struct
         Variant ("root", [ String (Path.to_absolute_filename root) ])
       | Build_context build_ctxt ->
         Variant ("build_context", [ String (Path.to_string build_ctxt) ])
+      | Package pack ->
+        Variant ("package_desc", [ Package_desc.to_dyn pack])
   end
 
   (** Description of a workspace: a list of items *)
@@ -394,6 +429,11 @@ module Crawl = struct
         Dune_rules.Main.build_system) (context : Context.t) :
       Descr.Workspace.t Memo.t =
     let sctx = Context_name.Map.find_exn scontexts context.name in
+    let packages_m = Install_rules.Stanzas_to_entries.stanzas_to_entries sctx in
+    let* packages = packages_m in
+    let pkgds = Package.Name.Map.foldi packages ~init:[] 
+    ~f:(fun key data acc  ->
+      Descr.Item.Package {Descr.Package_desc.name=key; entries=data} :: acc) in
     let open Memo.O in
     let* dune_files =
       Dune_load.Dune_files.eval conf.dune_files ~context
@@ -438,7 +478,7 @@ module Crawl = struct
     in
     let root = root () in
     let build_ctxt = build_ctxt context in
-    root :: build_ctxt :: (exes @ libs)
+    root :: build_ctxt :: (exes @ libs @ pkgds)
 end
 
 (** The following module is responsible sanitizing the output of
@@ -804,6 +844,102 @@ module Preprocess = struct
       |> Memo.of_non_reproducible_fiber
 end
 
+(** Computation and testing of the BUILD_PATH_PREFIX_MAP code. *)
+module Process_maps = struct
+  module Bppm = Build_path_prefix_map
+
+  let multi_item_to_dyn ((source, targets): (string * String.Set.t)) =
+    Dyn.record
+    [ ("source", String source)
+    ; ("targets", String.Set.to_dyn targets)]
+
+  let multi_to_dyn multi =
+    String.Map.to_list multi |> 
+    Dyn.list multi_item_to_dyn 
+
+  let multis_to_dyn multis =
+    Dyn.record (String.Map.foldi multis ~init:[]
+      ~f:(fun ctx_name multi acc ->
+        (ctx_name, multi_to_dyn multi) :: acc))
+
+  let check_one_one (maps: Dune_rules.Install_rules.Build_map.t) =
+    String.Map.foldi maps ~init:String.Map.empty
+      ~f:(fun context map acc1 -> 
+      let src_targets = Stdlib.List.fold_left (fun acc opt_pair ->
+        match opt_pair with
+        | None -> acc
+        | Some {Bppm.source; target} ->
+          String.Map.update acc source ~f:(function
+          | None -> Some (String.Set.singleton target)
+          | Some old_set -> Some (String.Set.add old_set target))
+          ) String.Map.empty map in
+      let multi_list = List.filter (String.Map.to_list src_targets) 
+        ~f:(fun (_source, targets) -> 
+          String.Set.cardinal targets > 1) in
+      let multi = String.Map.of_list_exn multi_list in
+      String.Map.add_exn acc1 context multi)
+
+  let check_consistency (full_map: Bppm.map String.Map.t) 
+    abbrev_maps 
+    (multis: String.Set.t String.Map.t String.Map.t) =
+    Dyn.Record (String.Map.foldi full_map ~init:[]
+      ~f:(fun ctx_name map acc1 ->
+      match String.Map.find abbrev_maps ctx_name with
+      | None -> (ctx_name, Dyn.string "Missing abbrev map") :: acc1
+      | Some abbrev_map -> 
+      match String.Map.find multis ctx_name with
+      | None -> (ctx_name, Dyn.string "Missing mulis map") :: acc1
+      | Some multi -> 
+      let inconsistencies = Stdlib.List.fold_left (fun acc opt_pair ->
+        match opt_pair with
+        | None -> acc
+        | Some {Bppm.source; target} ->
+          let abbrev_target = Bppm.rewrite abbrev_map source in
+          if abbrev_target = target then acc
+          else
+            match String.Map.find multi source with
+            | Some targets ->
+              if String.Set.mem targets abbrev_target then acc
+              else Dyn.variant "multi not in set"
+                [Dyn.record
+                  [ ("source", Dyn.string source)
+                  ; ("full_target", Dyn.string target)
+                  ; ("abbrev_target", Dyn.string abbrev_target)
+                  ; ("targets", 
+                    Dyn.list Dyn.string (String.Set.to_list targets))
+                  ]
+                ] :: acc
+            | None -> 
+            Dyn.record
+            [ ("source", Dyn.string source)
+            ; ("full_target", Dyn.string target)
+            ; ("abbrev_target", Dyn.string abbrev_target)] :: acc
+        ) [] map in
+        (ctx_name, Dyn.List inconsistencies) :: acc1
+        ))
+
+  let run (setup: Dune_rules.Main.build_system) =
+        let open Memo.O in
+        let* full_maps = 
+          Install_rules.Build_map.build_all_maps_full setup.scontexts in
+        let* tree_dyns =
+          Install_rules.Build_map.build_tree_dyn setup.scontexts in
+        let multis = check_one_one full_maps in
+        let* abbrev_maps = 
+          Install_rules.Build_map.build_all_maps setup.scontexts in
+        let inconstistency = 
+          check_consistency full_maps abbrev_maps multis in
+        let res = 
+          Dyn.Record
+          [ ("full_maps", Install_rules.Build_map.to_dyn full_maps)
+          ; ("multi_targets", multis |> multis_to_dyn)
+          ; ("tree", tree_dyns)
+          ; ("inconsistency", inconstistency)
+          ; ("abbrev_maps", Install_rules.Build_map.to_dyn abbrev_maps)] in
+        Memo.return (Some res)
+  
+end
+
 (* What to describe. To determine what to describe, we convert the positional
    arguments of the command line to a list of atoms and we parse it using the
    regular [Dune_lang.Decoder].
@@ -817,6 +953,7 @@ module What = struct
     | External_lib_deps
     | Opam_files
     | Pp of string
+    | Map
 
   (** By default, describe the whole workspace *)
   let default = Workspace { dirs = None }
@@ -853,6 +990,11 @@ module What = struct
       , "Print out external libraries needed to build the project. It's an \
          approximated set of libraries."
       , return External_lib_deps )
+    ; ( "map"
+      , []
+      , "Build BUILD_PATH_PREFIX_MAP"
+      , return Map
+      )
     ]
 
   (* The list of documentation strings (one for each command) *)
@@ -925,6 +1067,7 @@ module What = struct
       let open Memo.O in
       let+ () = Preprocess.run super_context file in
       None
+    | Map -> Process_maps.run setup
 end
 
 module Options = struct

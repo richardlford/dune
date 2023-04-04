@@ -1191,3 +1191,304 @@ let gen_project_rules sctx project =
   Package.Name.Map_traversals.parallel_iter packages ~f:(fun _name package ->
       let* () = gen_package_install_file_rules sctx package in
       gen_install_alias sctx package)
+
+module Build_path_prefix_map_dyn = struct
+  open Build_path_prefix_map
+  open Dyn
+
+  let pair_to_dyn = function
+  | {target; source} -> 
+    record 
+    [ ("target", string target)
+    ; ("source", string source)
+    ]
+
+  let to_dyn map =
+    list (option pair_to_dyn) map
+end
+
+module Abbrev_map = struct
+  module Bppm = Build_path_prefix_map
+
+  let bppm_compare l r = 
+      Option.compare 
+        (fun {Build_path_prefix_map.source=left;_} 
+              {source=right;_} -> 
+          String.compare left right) l r
+
+  type leaf = {
+    leaf_name: string; 
+    leaf_target: string 
+    }
+  
+  let leaf_to_dyn {leaf_name; leaf_target} =
+    let open Dyn in
+    record
+    [ ("leaf_name", string leaf_name)
+    ; ("leaf_target", string leaf_target)]
+
+  type dir = {
+    dir_name: string;
+    parent: dir option;
+    mutable leaves: leaf String.Map.t;
+    mutable children: dir String.Map.t
+    }
+
+  let rec dir_to_dyn d =
+      let open Dyn in
+      record
+      [ ("dir_name", string d.dir_name)
+      ; ("parent", match d.parent with 
+                   | None -> string ""
+                   | Some p ->  string p.dir_name)
+      ; ("leaves", String.Map.to_dyn leaf_to_dyn d.leaves)
+      ; ("children", String.Map.to_dyn dir_to_dyn d.children)]
+  
+  let root_to_dyn root =
+    dir_to_dyn root
+
+  let find_make_dir root dir_path =
+    let parts = String.split dir_path ~on:'/' in
+    List.fold_left parts ~init: root ~f:(fun parent part ->
+      match String.Map.find parent.children part with
+      | Some d -> d
+      | None -> 
+        let new_dir = {
+          dir_name=part; 
+          parent=Some parent;
+          leaves=String.Map.empty;
+          children=String.Map.empty
+          } in
+        parent.children <- String.Map.add_exn parent.children part new_dir;
+        new_dir
+      )
+
+  let build_tree root map: unit =
+    (* Note that the input map has been preprocessed so that
+       only sources whose basename matches their target are given.
+       Others require their own mapping pair. *)
+    List.iter map ~f:(fun opt_pair ->
+      match opt_pair with
+      | None -> ()
+      | Some {Bppm.source; target} ->
+        let src_dirname = Filename.dirname source in
+        let leaf_name = Filename.basename source in
+        let dir = find_make_dir root src_dirname in
+        match String.Map.find dir.leaves leaf_name with
+        | Some _leaf -> ()
+        | None -> 
+          let new_leaf = {leaf_name; leaf_target=target} in
+          dir.leaves <- String.Map.add_exn dir.leaves leaf_name new_leaf;
+    )
+
+  let rec abbreviate_tree (d: dir) =
+    match d.parent with
+    | None -> ()  (* Do nothing with root *)
+    | Some parent -> 
+
+    (* The list of children by modified by the children
+       so get a copy first. We are doing post-order traversal *)
+    let child_list = String.Map.to_list d.children in
+    List.iter child_list ~f:(fun (_child_name, child_dir) ->
+      abbreviate_tree child_dir);
+    
+    (* Do all leaves go to the same target directory? *)
+    let target_dir = ref "" in
+    let max_count = ref 0 in
+    let target_dirs = String.Map.fold d.leaves ~init:String.Map.empty
+      ~f:(fun {leaf_target;_} acc ->
+        let tgt_dir = Filename.dirname leaf_target in
+        String.Map.update acc tgt_dir ~f:(fun arg ->
+        let result = match arg with 
+        | None -> Some 1
+        | Some count -> Some (count + 1) in
+        (match result with
+        | None -> ()
+        | Some count -> 
+          if count > !max_count then begin
+            max_count := count;
+            target_dir := tgt_dir;
+          end);
+        result
+        )) in
+
+    let leaf_card = String.Map.cardinal target_dirs in
+    let child_card = String.Map.cardinal d.children in
+    match leaf_card, child_card with
+    | 0, 0 ->
+      (* No longer any children or leaves. Remove as child of parent. *)
+      parent.children <- String.Map.remove parent.children d.dir_name;
+      ()
+    | 0, _ -> () (* No leaves but still children with leaves. *)
+    | 1, 0 -> 
+      (* All the leaves have the same destination, d, and there are
+         no children. Make a new leaf in the parent mapping this
+         directory to the common target. *)
+      
+      let new_leaf = {leaf_name=d.dir_name; leaf_target=(!target_dir)} in
+      parent.leaves <- String.Map.add_exn parent.leaves d.dir_name new_leaf;
+      parent.children <- String.Map.remove parent.children d.dir_name;
+    | 1, _ -> 
+      (* All the same target, but there are children. The children mappings
+         will be longer, so we can still make a new leaf, but cannot
+         remove ourselves from the tree. *)
+      let new_leaf = {leaf_name=d.dir_name; leaf_target=(!target_dir)} in
+      parent.leaves <- String.Map.add_exn parent.leaves d.dir_name new_leaf;
+      ()
+    | _, _ -> 
+      (* Multiple distinations. If there is a destination that is
+         used more than once, we can still reduce the number of
+         mappings by letting it be covered by the directory. *)
+      if !max_count > 1 then begin
+        (* Get the names of the leaves to remove. *)
+        let to_remove = String.Map.fold d.leaves ~init:[]
+          ~f:(fun {leaf_name;leaf_target} acc ->
+          let tgt_dir = Filename.dirname leaf_target in
+          if tgt_dir = !target_dir then leaf_name :: acc
+          else acc) in
+          List.iter to_remove ~f:(fun name ->
+            d.leaves <- String.Map.remove d.leaves name);
+        let new_leaf = {leaf_name=d.dir_name; leaf_target=(!target_dir)} in
+        parent.leaves <- String.Map.add_exn parent.leaves d.dir_name new_leaf;
+      end
+
+  let rec expand_dir (d: dir) path acc : 
+      Bppm.map =
+    let acc = String.Map.foldi d.children ~init:acc
+      ~f:(fun (child_name: string) (child_dir: dir) acc -> 
+        let child_path = Filename.concat path child_name in
+        expand_dir child_dir child_path acc @ acc
+        ) in
+    String.Map.foldi d.leaves ~init:acc
+      ~f:(fun (_leaf_name: string) {leaf_name;leaf_target} acc ->
+        let leaf_path = Filename.concat path leaf_name in
+        Some {Bppm.source=leaf_path;target=leaf_target} :: acc)
+
+  let expand_tree root =
+    expand_dir root "" []
+
+  let build_tree_dyn (map: Build_path_prefix_map.map) =
+      let root = {
+        dir_name=""; 
+        parent=None;
+        leaves=String.Map.empty;
+        children=String.Map.empty
+        } in
+      let open Filename in
+      let result = ref [] in
+      let worklist = Stdlib.List.fold_left (fun acc opt_pair ->
+          match opt_pair with
+          | None -> acc
+          | Some {Bppm.source; target} as pr -> 
+            if basename source <> basename target then begin
+              result := pr :: !result;
+              acc
+            end else pr :: acc) [] map in
+      build_tree root worklist;
+      root_to_dyn root
+
+  let abbreviate_map (map: Build_path_prefix_map.map) =
+    let root = {
+      dir_name=""; 
+      parent=None;
+      leaves=String.Map.empty;
+      children=String.Map.empty
+      } in
+    let open Filename in
+    let result = ref [] in
+    let worklist = Stdlib.List.fold_left (fun acc opt_pair ->
+        match opt_pair with
+        | None -> acc
+        | Some {Bppm.source; target} as pr -> 
+          if basename source <> basename target then begin
+            result := pr :: !result;
+            acc
+          end else pr :: acc) [] map in
+    build_tree root worklist;
+    abbreviate_tree root;
+    let expanded = expand_tree root in
+    let sorted = List.sort (expanded @ !result) ~compare:bppm_compare in
+    sorted
+end
+
+module Build_map = struct
+  open Dune_engine
+  open Memo.O
+  module Bppm = Build_path_prefix_map
+  
+  type t = Build_path_prefix_map.map String.Map.t
+
+  let to_dyn (cmap: t) : Dyn.t =
+    let open Dyn in
+    record (String.Map.foldi cmap ~init:[]
+      ~f:(fun ctx_name map acc ->
+      (ctx_name, Build_path_prefix_map_dyn.to_dyn map) :: acc))
+
+  let build_package_map pkg
+      (entries_in: Install.Entry.Sourced.t list) : 
+      Build_path_prefix_map.map =
+    let prefix_path = Path.of_string "/install_root" in
+    let cwd = Sys.getcwd() in
+    let entries = List.map entries_in 
+      ~f: (fun (es: Install.Entry.Sourced.t) -> 
+        let (e: Path.Build.t Install.Entry.t) = es.entry in
+        let source = Path.Build.to_string e.src in
+        let target = Install.Dst.to_string e.dst in
+        let source = Filename.concat cwd source in
+        let targetp = Install.Section.Paths.get_location_from_prefix
+          prefix_path e.section pkg in
+        let target = Path.relative targetp target in
+        let target = Path.to_string target in
+        let source = String.drop_suffix_if_exists ~suffix:"/" source in
+        let target = String.drop_suffix_if_exists ~suffix:"/" target in
+        Some {Build_path_prefix_map.source; target}) in
+      entries
+
+  let build_context_map (sctx: Super_context.t) :
+      Build_path_prefix_map.map Memo.t =
+    let* packages = Stanzas_to_entries.stanzas_to_entries sctx in
+    let pkg_maps = List.concat (Package.Name.Map.foldi packages ~init:[]
+      ~f:(fun pkg entries acc  ->
+        build_package_map pkg entries :: acc)) in
+    let pkg_maps = List.sort pkg_maps ~compare:Abbrev_map.bppm_compare in
+    Memo.return pkg_maps
+
+  let build_all_maps_full (scontexts: Super_context.t Context_name.Map.t) =
+    let open Memo.O in
+    let ctxs = Context_name.Map.to_list scontexts in
+    let cwd = Sys.getcwd() in
+    let* pairs = Memo.sequential_map ctxs ~f:(fun (ctxn, sctx) -> 
+      let context = Super_context.context sctx in
+      let* map = build_context_map sctx in
+      let install_root = Path.to_string context.ocaml_bin |>
+        Filename.dirname in
+      let install_pair = Some {Build_path_prefix_map.target="/install_root"; 
+        source=install_root} in
+      let build_dir = 
+        Filename.concat cwd (Path.Build.to_string context.build_dir) in
+      let workspace_pair = 
+        Some {Build_path_prefix_map.target="/workspace_root"; 
+        source=build_dir} in
+      let map = install_pair :: workspace_pair :: map in 
+      let ctx_name =  (Context_name.to_string ctxn) in
+      Memo.return (ctx_name, map)
+      ) in
+    let maps = String.Map.of_list_reduce pairs ~f:(fun old _new -> old) in
+    Memo.return  maps
+
+  let build_tree_dyn (scontexts: Super_context.t Context_name.Map.t)  =
+    let* full_maps = build_all_maps_full scontexts in
+    let tree_dyns = String.Map.foldi full_maps ~init:[] 
+      ~f:(fun ctx_name full_map acc ->
+      let tree_dyn = Abbrev_map.build_tree_dyn full_map in
+      (ctx_name, tree_dyn) :: acc) in
+    Memo.return (Dyn.Record tree_dyns)
+    
+  let build_all_maps (scontexts: Super_context.t Context_name.Map.t)  =
+    let* full_maps = build_all_maps_full scontexts in
+    let maps = String.Map.foldi full_maps ~init:String.Map.empty 
+      ~f:(fun ctx_name full_map acc ->
+      let abbrev_map = Abbrev_map.abbreviate_map full_map in
+      String.Map.add_exn acc ctx_name abbrev_map) in
+    Memo.return maps
+end

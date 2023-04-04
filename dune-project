@@ -1,9 +1,10 @@
-(lang dune 3.5)
+(lang dune 3.7)
 ;          ^^^
 ; When changing the version, don't forget to regenerate *.opam files
 ; by running [dune build].
 (name dune)
 
+(map_workspace_root false)
 (generate_opam_files true)
 
 (accept_alternative_dune_file_name)

@@ -438,6 +438,7 @@ let expand_pform_gen ~(context : Context.t) ~bindings ~dir ~source
             invalid_use_of_target_variable t ~source ~var_multiplicity:Multiple)
       | Ocaml -> static (get_prog context.ocaml.ocaml)
       | Ocamlc -> static (path context.ocaml.ocamlc)
+      | Ocamldebug -> static (path context.ocaml.ocamldebug)
       | Ocamlopt -> static (get_prog context.ocaml.ocamlopt)
       | Make ->
         let open Memo.O in

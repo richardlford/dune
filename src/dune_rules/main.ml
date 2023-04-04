@@ -71,6 +71,9 @@ let get () =
   let* contexts = Context.DB.all () in
   let* scontexts = Memo.Lazy.force Super_context.all in
   let* () = Super_context.all_init_deferred () in
+  let* maps = Install_rules.Build_map.build_all_maps scontexts in
+  Dune_util.Build_path_prefix_map0.map_for_context :=
+    maps;
   Memo.return { conf; contexts; scontexts }
 
 let find_context_exn t ~name =

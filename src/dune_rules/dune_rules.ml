@@ -65,6 +65,8 @@ module Dialect = Dialect
 
 module Install_rules = struct
   let install_file = Install_rules.install_file
+  module Stanzas_to_entries = Install_rules.Stanzas_to_entries
+  module Build_map = Install_rules.Build_map
 end
 
 (* Only for tests *)

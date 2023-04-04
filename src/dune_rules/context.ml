@@ -470,6 +470,15 @@ let create ~(kind : Kind.t) ~path ~env ~env_nodes ~name ~merlin ~targets
       ; build_dir = Context_name.build_dir name
       ; path
       ; ocaml
+<<<<<<< HEAD
+=======
+      ; ocamlc
+      ; ocamldebug
+      ; ocamlopt
+      ; ocamldep
+      ; ocamlmklib
+      ; ocamlobjinfo
+>>>>>>> 9fc1b0785 (Support for ocamldebug)
       ; env
       ; findlib_paths = ocamlpath @ default_ocamlpath
       ; findlib_toolchain
@@ -694,6 +703,26 @@ module DB = struct
     get context
 end
 
+<<<<<<< HEAD
+=======
+let compiler t (mode : Ocaml.Mode.t) =
+  match mode with
+  | Byte -> Ok t.ocamlc
+  | Native -> t.ocamlopt
+
+let ocamldebug t = t.ocamldebug
+
+let best_mode t : Mode.t =
+  match t.ocamlopt with
+  | Ok _ -> Native
+  | Error _ -> Byte
+
+let cc_g (ctx : t) =
+  match ctx.lib_config.ccomp_type with
+  | Msvc -> []
+  | Other _ -> [ "-g" ]
+
+>>>>>>> 9fc1b0785 (Support for ocamldebug)
 let name t = t.name
 
 let lib_config t = t.lib_config
